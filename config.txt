@@ -1,0 +1,19 @@
+# AIdle settings.
+# One setting per line, written as name=value. Blank lines and lines starting
+# with # are ignored. Edit these, save the file, and restart the game.
+#
+# Heads up: api_key is a secret. If you put a real key in here, don't commit
+# this file or share it with anyone.
+
+# Your API key. If either this or api_url is blank, the game opens a popup on
+# startup to ask for the missing one(s).
+api_key=
+
+# The chat completions endpoint to talk to. Point this at any OpenAI-compatible
+# provider (OpenRouter, a local server, etc). If blank, the startup popup asks
+# for it.
+api_url=https://openrouter.ai/api/v1/chat/completions
+
+# The model the model box starts with. If blank, the box shows a grey "Model ID"
+# placeholder and you type the model in the game window.
+default_model_id=openai/gpt-6-luna

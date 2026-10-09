@@ -12,7 +12,7 @@ from urllib.request import Request, urlopen#making requests on the internet
 
 # the files and settings that never change
 words_file = Path(__file__).with_name("words.txt")
-api_url = "https://openrouter.ai/api/v1/chat/completions"
+config_file = Path(__file__).with_name("config.txt")
 max_guesses = 6
 word_length = 5
 
@@ -24,8 +24,12 @@ thinking_off = 0
 max_retries = 3
 max_restarts = 3
 
-#the only model this game uses. the other ones are just not good enough. i can't figure out how to fix them. i've tried for hours. if you think you can fix it, godspeed.
-model_id = "openai/gpt-6-luna"
+#these three settings live in config.txt. if the file leaves api_url or api_key
+#blank the game asks for them in a popup when it opens. if it leaves the model
+#blank the model box shows a placeholder and you type one in the window.
+api_url = ""
+default_model_id = ""
+model_id = default_model_id
 
 system_prompt = """You're playing Wordle. The answer is a common five-letter English word. You have six guesses.
 ON YOUR FIRST TURN there is no feedback yet, because you have not guessed anything. Just pick a strong opening word and go. Do not ask me for feedback, do not ask what the rules are, do not ask for the board. I will always send you feedback after every guess, so on later turns the feedback for your last guess is at the bottom of my message.
@@ -65,6 +69,7 @@ colors = {
     "border": "#d3d6da",
     "background": "#ffffff",
     "text": "#1a1a1b",
+    "placeholder": "#9a9a9a",
     "key": "#d3d6da",
 }
 
@@ -101,9 +106,14 @@ tiles = []
 key_buttons = {}
 llm_output = None
 llm_button = None
+model_entry = None
+# this is 1 while the grey "Model ID" placeholder is sitting in the model box
+model_placeholder_on = 0
+model_placeholder_text = "Model ID"
 
 responses = None
 stream_tokens = None
+# usually comes from config.txt or the popup (see load_settings / ask_for_connection)
 api_key = ""
 
 # the thread that is currently talking to openrouter, so the stop button can
@@ -130,6 +140,34 @@ def load_words():
 
     words.sort()
     return words
+
+def load_settings():
+    # the api key, endpoint and default model live in config.txt so they can be
+    # changed without editing this file. anything not set there is left blank,
+    # and the game asks for it (url/key popup) or shows a placeholder (model).
+    global api_url, default_model_id, model_id, api_key
+
+    try:
+        filetext = config_file.read_text(encoding="utf-8")
+    except OSError:
+        # no config file, everything stays blank
+        return
+
+    for line in filetext.splitlines():
+        oneline = line.strip()
+        if oneline == "" or oneline.startswith("#") or "=" not in oneline:
+            continue
+        name, value = oneline.split("=", 1)
+        name = name.strip()
+        value = value.strip()
+        if name == "api_url" and value != "":
+            api_url = value
+        elif name == "default_model_id" and value != "":
+            default_model_id = value
+        elif name == "api_key":
+            api_key = value
+
+    model_id = default_model_id
 
 def score_guess(guess, answer):
     marks = ["absent"] * word_length
@@ -256,10 +294,83 @@ def add_key(parent, label, command, wide=False):
     if len(label) == 1 and label.isalpha():
         key_buttons[label.lower()] = button
 
+# helpers for the model box in the window
+def model_field_is_empty():
+    # true when the box is blank or only showing the grey placeholder
+    return model_placeholder_on == 1 or model_entry.get().strip() == ""
+
+
+def get_typed_model():
+    # the model the player actually typed, ignoring the placeholder
+    if model_placeholder_on == 1:
+        return ""
+    return model_entry.get().strip()
+
+
+def show_model_placeholder():
+    # put the grey "Model ID" hint in an empty box
+    global model_placeholder_on
+    model_placeholder_on = 1
+    model_entry.delete(0, "end")
+    model_entry.insert(0, model_placeholder_text)
+    model_entry.config(fg=colors["placeholder"])
+
+
+def hide_model_placeholder():
+    # clear the grey hint so the player can type
+    global model_placeholder_on
+    if model_placeholder_on == 1:
+        model_placeholder_on = 0
+        model_entry.delete(0, "end")
+        model_entry.config(fg=colors["text"])
+
+
+def on_model_focus_in(event):
+    hide_model_placeholder()
+
+
+def on_model_focus_out(event):
+    if model_entry.get().strip() == "":
+        show_model_placeholder()
+
+
+def on_model_key(event):
+    # runs after the entry has taken the new character, then updates the log
+    model_entry.after_idle(refresh_model_status)
+
+
+def model_status_line():
+    # the first line of the log. names the model, or warns that none is set
+    if model_field_is_empty():
+        return "NO MODEL ID SET; ENTER BELOW"
+    return "Model: " + get_typed_model()
+
+
+def refresh_model_status():
+    # rewrite only the first line of the log and leave everything below it
+    if llm_output is None:
+        return
+    llm_output.config(state="normal")
+    llm_output.delete("1.0", "2.0")
+    llm_output.insert("1.0", model_status_line() + "\n")
+    llm_output.config(state="disabled")
+
+
+def sync_model_entry_state():
+    # the model box is locked while the ai is playing. it frees up when the game
+    # ends on its own or the stop button is pressed (both set llm_active to 0)
+    if model_entry is None:
+        return
+    wanted = "disabled" if llm_active == 1 else "normal"
+    if str(model_entry.cget("state")) != wanted:
+        model_entry.config(state=wanted)
+
+
 #lot of visual stuff
 def build_the_game():
     global all_words, responses, stream_tokens
     global message_label, tiles, key_buttons, llm_output, llm_button, stop_button
+    global model_entry
 
     all_words = load_words()
 
@@ -402,11 +513,37 @@ def build_the_game():
     )
     llm_button.pack(side="right")
 
+    # the model box fills the gap to the left of the start button and is
+    # stretched to the same height as that button
+    model_entry = tkinter.Entry(
+        button_row,
+        font=("Helvetica", 10),
+        relief="solid",
+        bd=1,
+    )
+    button_row.update_idletasks()
+    entry_extra = max(llm_button.winfo_reqheight() - model_entry.winfo_reqheight(), 0)
+    model_entry.pack(
+        side="left",
+        fill="x",
+        expand=True,
+        padx=(0, 6),
+        ipady=entry_extra // 2,
+    )
+    model_entry.bind("<FocusIn>", on_model_focus_in)
+    model_entry.bind("<FocusOut>", on_model_focus_out)
+    model_entry.bind("<KeyRelease>", on_model_key)
+    # prefill with the configured model, or show the grey hint if there is none
+    if model_id.strip() != "":
+        model_entry.insert(0, model_id)
+    else:
+        show_model_placeholder()
+
     root.bind("<Key>", on_keypress)
     new_game()
     root.after(100, check_llm_responses)
-    #immediately ask for api key for OR
-    root.after(200, prompt_for_key)
+    # ask for anything the config file did not fill in
+    root.after(200, prompt_for_connection)
 
 
 def new_game():
@@ -436,7 +573,7 @@ def new_game():
     llm_button.config(text="Start LLM game", state="normal")
     stop_button.config(state="disabled")
     set_llm_output(
-        "Model: " + model_id + "\nPress start LLM game to let the model play this match\n"
+        model_status_line() + "\nPress start LLM game to let the model play this match\n"
     )
     clear_message()
 
@@ -590,10 +727,11 @@ def submit_guess():
             request_llm_guess()
 
 
-def ask_for_api_key():
-    #makes it open another smaller window popup
+def ask_for_connection():
+    #makes it open another smaller window popup. it asks for both the api key
+    #and the base url, and pre-fills whichever one we already have
     dialog = tkinter.Toplevel(root)
-    dialog.title("API key")
+    dialog.title("AI settings")
     dialog.configure(bg=colors["background"])
     dialog.resizable(False, False)
     dialog.transient(root)
@@ -603,14 +741,31 @@ def ask_for_api_key():
     frame.pack()
     tkinter.Label(
         frame,
-        text="Enter OpenRouter API key:",
+        text="Enter API key",
         font=("Helvetica", 10, "bold"),
         bg=colors["background"],
         fg=colors["text"],
     ).pack(anchor="w")
-    entry = tkinter.Entry(frame, show="*", width=48, font=("Helvetica", 11))#not showing what is typed is apperently good practice for api stuff
-    entry.pack(anchor="w", pady=(8, 2))
-    entry.focus_set()
+    key_entry = tkinter.Entry(frame, show="*", width=48, font=("Helvetica", 11))#not showing what is typed is apperently good practice for api stuff
+    key_entry.pack(anchor="w", pady=(6, 2))
+    tkinter.Label(
+        frame,
+        text="Enter OpenAI-compatible base URL",
+        font=("Helvetica", 10, "bold"),
+        bg=colors["background"],
+        fg=colors["text"],
+    ).pack(anchor="w", pady=(10, 0))
+    url_entry = tkinter.Entry(frame, width=48, font=("Helvetica", 11))
+    url_entry.pack(anchor="w", pady=(6, 2))
+    # fill in whatever the config file already gave us
+    if api_key != "":
+        key_entry.insert(0, api_key)
+    if api_url != "":
+        url_entry.insert(0, api_url)
+    if api_key == "":
+        key_entry.focus_set()
+    else:
+        url_entry.focus_set()
     status_label = tkinter.Label(
         frame,
         text="",
@@ -620,7 +775,7 @@ def ask_for_api_key():
         wraplength=320,
         justify="left",
     )
-    status_label.pack(anchor="w")
+    status_label.pack(anchor="w", pady=(6, 0))
     # a box instead of a normal variable, otherwise confirm() could not change it
     result = {"ok": False}
     buttons = tkinter.Frame(frame, bg=colors["background"])
@@ -635,23 +790,27 @@ def ask_for_api_key():
 
     def confirm(event=None):
         # the unlock button was pressed
-        # global here so the key we get stays saved after the popup is gone
-        global api_key
-        value = entry.get().strip()
-        if value == "":
-            status_label.config(text="Please enter an API key.")
+        # globals here so what we get stays saved after the popup is gone
+        global api_key, api_url
+        key = key_entry.get().strip()
+        url = url_entry.get().strip()
+        if key == "":
+            status_label.config(text="Please enter an API key.", fg="#c0392b")
             return
-        status_label.config(text="Testing key...", fg=colors["text"])
+        if url == "":
+            status_label.config(text="Please enter a base URL.", fg="#c0392b")
+            return
+        status_label.config(text="Testing...", fg=colors["text"])
         set_buttons_enabled(False)
         dialog.update_idletasks()
 
-        ok, message = test_api_key(value)
+        ok, message = test_api_key(key, url)
         if not ok:
             status_label.config(text=message, fg="#c0392b")
             set_buttons_enabled(True)
-            entry.focus_set()
             return
-        api_key = value
+        api_key = key
+        api_url = url
         result["ok"] = True
         dialog.destroy()
 
@@ -671,14 +830,18 @@ def ask_for_api_key():
     return result["ok"]
 
 #FROM DOCS
-def test_api_key(candidate_key):
+def test_api_key(candidate_key, candidate_url):
+    # with no model chosen yet there is nothing valid to send, so there is
+    # nothing to test. the url and key still get saved and used later.
+    if model_id == "":
+        return True, ""
     body = json.dumps({
         "model": model_id,
         "messages": [{"role": "user", "content": "Hi"}],
         "max_tokens": 1,
     }).encode("utf-8")
     request = Request(
-        api_url,
+        candidate_url,
         data=body,
         headers={
             "Authorization": "Bearer " + candidate_key,
@@ -699,35 +862,47 @@ def test_api_key(candidate_key):
         if error.code == 429:
             return True, ""
         return False, "Key test failed (HTTP " + str(error.code) + "): " + detail[:120]
-    except (URLError, TimeoutError) as error:
+    except (URLError, TimeoutError, ValueError) as error:
         return False, "Network error while testing key: " + str(error)
 
 
-def prompt_for_key():
-    #ask for the key when the game opens
-    if api_key == "":
-        ask_for_api_key()
+def prompt_for_connection():
+    #only ask when the config file did not give us both the url and the key
+    if api_key == "" or api_url == "":
+        ask_for_connection()
 
 #the start llm game button was pressed
 def start_llm():
 
     global llm_active, llm_messages, llm_guesses, streaming_reasoning_shown, llm_retries, llm_restarts
+    global model_id
 
-    if api_key == "":
-        if ask_for_api_key() == False:
-            append_llm_output("API key not entered. LLM play cancelled.\n")
+    # pick up whatever model the player typed into the box. if it is empty fall
+    # back to the configured default, and if there is none we can't play.
+    entered_model = get_typed_model()
+    if entered_model == "":
+        entered_model = default_model_id.strip()
+    if entered_model == "":
+        append_llm_output("\nNo model ID set. Type one in the box first.\n")
+        return
+    model_id = entered_model
+
+    if api_key == "" or api_url == "":
+        if ask_for_connection() == False:
+            append_llm_output("API settings not entered. LLM play cancelled.\n")
             return
     if finished == 1 or len(llm_guesses) > 0 or current_row > 0:
         new_game()
 
     llm_active = 1
+    sync_model_entry_state()
     llm_button.config(text="LLM playing...", state="disabled")
     llm_messages = [{"role": "system", "content": system_prompt}]
     llm_guesses = []
     streaming_reasoning_shown = 0
     llm_retries = 0
     llm_restarts = 0
-    set_llm_output("Model: " + model_id + "\n\n")
+    set_llm_output(model_status_line() + "\n\n")
     request_llm_guess()
 
 
@@ -849,6 +1024,9 @@ def check_llm_responses():
     # background thread left in the queues and puts it into the window
     global llm_waiting, llm_active, llm_closing, streaming_reasoning_shown
     global llm_messages, llm_guesses, current_guess, current_cancel, llm_restarts, llm_retries
+
+    # lock or unlock the model box to match whether the model is playing
+    sync_model_entry_state()
 
     try:
         # 1. show the words as they come in, before the answer is finished
@@ -1055,6 +1233,10 @@ def clear_message():
 
 
 def on_keypress(event):
+    # ignore keys while the player is typing a model name into the entry box,
+    # otherwise their text would also get typed onto the game board
+    if isinstance(event.widget, tkinter.Entry):
+        return
     if event.keysym == "Return":
         submit_guess()
     elif event.keysym == "BackSpace":
@@ -1069,6 +1251,7 @@ def play():
     wordlist = load_words()
     if len(wordlist) == 0:
         return
+    load_settings()
     root = tkinter.Tk()
     build_the_game()
     root.mainloop()
